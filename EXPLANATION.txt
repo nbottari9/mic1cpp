@@ -1,0 +1,511 @@
+MIC-1 EMULATOR — COMPLETE WALKTHROUGH
+======================================
+
+This is a software emulation of the MIC-1 microarchitecture from Andrew Tanenbaum's
+"Structured Computer Organization". It simulates hardware at the BIT level — every
+single bit is stored as the ASCII character '0' or '1' in a C char array. Nothing is
+stored as an actual integer during execution; it's all string manipulation pretending
+to be wire signals. This is slow but makes the logic mirror the hardware exactly.
+
+
+THE BIG PICTURE
+---------------
+
+    [Control Store / PROM]
+            |
+            | microinstruction (MIR)
+            v
+    [ActivateControlStore] ---control signals---> [ActivateDataPath]
+                                                         |
+                                  +----------------------+
+                                  |           |          |
+                               [ALU]     [Shifter]  [Registers]
+                                  |
+                             [Memory]
+
+Each "tick" of the CPU is one subcycle (1-4). Every 4 subcycles = one full microcycle,
+which executes one microinstruction. The CPU is MICROPROGRAMMED: real machine
+instructions (IJVM-style) are themselves built from sequences of these microinstructions
+stored in the control store.
+
+
+THE 4 SUBCYCLES
+---------------
+
+    Subcycle 1: Load MIR from control store; set control signals (AMUX, ALU, SHIFT, RD, WR...)
+    Subcycle 2: Decode A/B register fields; latch register values into ALatch and BLatch
+    Subcycle 3: Run the ALU; run the shifter; optionally load MAR from BLatch
+    Subcycle 4: Write shifter result to destination register; optionally update MBR; advance MicroPC
+
+
+================================================================================
+globals.h — The Type System
+================================================================================
+
+    #define Zero         '0'
+    #define One          '1'
+    #define AddrWordSize 13   // 12 address bits + null terminator
+    #define DataWordSize 17   // 16 data bits + null terminator
+
+    typedef char AddressBusType[13];  // "000000000000\0"
+    typedef char DataBusType[17];     // "0000000000000000\0"
+    typedef char TwoBits[2];          // two-bit control field
+    typedef char Bit;                 // single '0' or '1'
+
+KEY INSIGHT: A "16-bit register" is literally a 16-character string like
+"0000000100000000". Addition, AND, NOT — all of it operates on these character
+strings one char at a time. This is deliberate: it models the fact that in
+hardware, bits are individual wires.
+
+
+================================================================================
+clock.c — The Heartbeat
+================================================================================
+
+    struct Clock Quartz = {0, 0};  // Cycle counter + subcycle (1-4)
+
+GeneratePulse() advances the subcycle:
+
+    Quartz.Subcycle = (Quartz.Subcycle % 4) + 1;  // cycles: 1->2->3->4->1->2->...
+    if (Quartz.Subcycle == 1)
+        Quartz.Cycle++;  // one full microcycle completed
+
+FirstSubcycle() through FourthSubcycle() just return true/false based on the
+current subcycle. The rest of the code calls these to know WHEN to do each
+phase of work.
+
+
+================================================================================
+control.c — The Control Store (Microprogram Memory)
+================================================================================
+
+DATA STRUCTURES
+---------------
+
+    MicroWord MicroMemory[256];  // 256 microinstructions, each 32 bits wide (as chars)
+    int       MicroPc = 0;       // which microinstruction to execute next
+    MicroWord MIR;               // the currently-loaded microinstruction register
+
+
+BurnInProm(char *prom_file)
+---------------------------
+Reads a .dat file of 32-character binary strings (one per line) into MicroMemory.
+This is the MICROPROGRAM — the firmware that defines how every machine instruction
+executes. For example, ADD might be implemented by 5-10 microinstructions stored here.
+
+
+THE MIR BIT LAYOUT (32 bits, indices 0-31)
+-------------------------------------------
+
+    Bit index:  0    1-2   3-4    5-6    7    8    9    10   11   12-15  16-19  20-23  24-31
+    Field:     AMUX COND  ALU   SHIFT  MBR  MAR   RD   WR   ENC  C-bus  B-bus  A-bus  ADDR
+
+    AMUX  [0]:     Selects left ALU input. 0=ALatch (from register), 1=MBR (from memory)
+    COND  [1-2]:   Branch condition. 00=never, 01=branch if N set, 10=branch if Z set, 11=always
+    ALU   [3-4]:   00=ADD, 01=AND, 10=pass A through, 11=NOT A
+    SHIFT [5-6]:   00=no shift, 01=shift right, 10=shift left
+    MBR   [7]:     If 1, write ALU/shifter result to MBR
+    MAR   [8]:     If 1, write B-bus value to MAR (memory address register)
+    RD    [9]:     If 1, issue a memory read
+    WR    [10]:    If 1, issue a memory write
+    ENC   [11]:    If 1, enable write-back to register from C-bus
+    C-field [12-15]: 4-bit code for which register to write (destination)
+    B-field [16-19]: 4-bit code for right ALU operand source register
+    A-field [20-23]: 4-bit code for left ALU operand source register
+    ADDR  [24-31]: 8-bit address of next microinstruction (used if branch taken)
+
+
+DecodeRegField(FourBits RField, DataBusType Field)
+--------------------------------------------------
+Converts a 4-bit register number to a ONE-HOT 16-bit selector string.
+Register 0 -> "1000000000000000", register 1 -> "0100000000000000", etc.
+Only one bit is '1', indicating which register is selected. The datapath
+then uses this one-hot pattern to switch to the right register.
+
+
+DecodeAField, DecodeBField, DecodeCField
+-----------------------------------------
+Extract the A/B/C fields from MIR and call DecodeRegField.
+Note DecodeCField checks MIR[11] (ENC bit) first — if it's '0', it outputs
+all zeros (no write-back).
+
+
+DetermineMmux — The Branch Logic
+----------------------------------
+    COND = 00: never branch   (Mmux = 0, meaning: increment MicroPC)
+    COND = 11: always branch  (Mmux = 1, meaning: jump to ADDR)
+    COND = 10: branch if ZBit == '1' (result was zero)
+    COND = 01: branch if NBit == '1' (result was negative)
+
+
+LoadMicroProgramCounter
+------------------------
+    if (Mmux == Zero)
+        MicroPc = MicroPc + 1;          // sequential execution
+    else
+        MicroPc = ConvertToCardinal(Addr);  // jump to ADDR field
+
+This is how the microprogram implements conditionals and loops.
+
+
+ActivateControlStore — The Main Control Loop
+---------------------------------------------
+Called every subcycle. Depending on which subcycle it is:
+
+    Subcycle 1: Loads MIR from MicroMemory[MicroPc] and sets all control lines
+    Subcycle 2: Decodes A and B register fields, sets control lines again
+    Subcycle 3: Just re-asserts control lines (signals must be stable during ALU)
+    Subcycle 4: Decodes C field, computes branch/next MicroPC, re-asserts control lines
+
+
+================================================================================
+datapath.c — The Registers and Data Flow
+================================================================================
+
+REGISTER FILE (16 registers)
+------------------------------
+
+    Index  Name             Value (initial)       Notes
+    -----  ---------------  --------------------  ---------------------------------
+    0      ProgramCounter   "0000000000000000"    PC
+    1      Accumulator      "0000000000000000"    AC
+    2      StackPointer     "0000000000000000"    SP
+    3      InstructionReg   "0000000000000000"    IR
+    4      TempInstruction  "0000000000000000"    TIR
+    5      ZeroRegister     "0000000000000000"    hardwired constant 0
+    6      PositiveOne      "0000000000000001"    hardwired constant +1
+    7      NegativeOne      "1111111111111111"    hardwired constant -1 (two's complement)
+    8      Amask            "0000111111111111"    address mask (12 bits)
+    9      Smask            "0000000011111111"    sign mask (8 bits)
+    10     ARegister        "0000000000000000"    general purpose
+    11     BRegister        "0000000000000000"    general purpose
+    12     CRegister        "0000000000000000"    general purpose
+    13     DRegister        "0000000000000000"    general purpose
+    14     ERegister        "0000000000000000"    general purpose
+    15     FRegister        "0000000000000000"    general purpose
+
+Also:
+    MAR    — Memory Address Register (12-bit AddressBusType)
+    MBR    — Memory Buffer Register (16-bit DataBusType, data in/out of memory)
+    ALatch — holds the A-bus value during a subcycle
+    BLatch — holds the B-bus value during a subcycle
+
+
+LoadMar(DataBusType DataLines)
+-------------------------------
+    for (I = 0; I <= 11; I++)
+        MAR[I] = DataLines[I+4];  // takes bits 4-15 of a 16-bit word -> 12-bit address
+
+The top 4 bits of a 16-bit word become the chip select + offset.
+Only the lower 12 bits are used as the address.
+
+
+SelectRegister(DataBusType Lines)
+----------------------------------
+Scans the one-hot 16-bit selector string and returns the index of whichever
+bit is '1'. Returns 16 if none (no register selected — a NOP for writes).
+
+
+LoadALatch / LoadBLatch
+------------------------
+Take the one-hot A-bits or B-bits, call SelectRegister to get a register
+number (0-15), then strcpy the corresponding register value into ALatch or BLatch.
+
+
+LoadRegisterBank(CBits, DataLines)
+------------------------------------
+The write-back step. Uses the one-hot C-bits to select which register to copy
+DataLines into. Registers 5-9 (ZeroRegister, PositiveOne, NegativeOne, Amask,
+Smask) are NOT in this switch — they are read-only constants.
+
+
+ActivateDataPath — The Full Datapath Sequence
+----------------------------------------------
+    // At start of every subcycle: sync MAR and MBR from bus pins
+    strcpy(MAR, MarRegs);
+    strcpy(MBR, MbrRegs);
+
+    // Subcycle 2: latch source registers
+    LoadALatch(ABits);
+    LoadBLatch(BBits);
+
+    // Subcycle 3: run computation
+    if (AmuxBit == One)
+        LeftOperand = MBR;    // reading from memory? use MBR as left operand
+    else
+        LeftOperand = ALatch; // otherwise use the A register
+
+    if (MarBit == One)
+        LoadMar(BLatch);      // load 12-bit address into MAR from B-bus
+
+    ActivateAlu(LeftOperand, BLatch, AluBits, AluResult, &NBit, &ZBit);
+    ActivateShifter(AluResult, ShiftBits, ShifterResult);
+
+    // Subcycle 4: write results back
+    LoadRegisterBank(CBits, ShifterResult);  // write to destination register
+    if (MbrBit == One)
+        MBR = ShifterResult;  // also write to MBR (for memory writes)
+
+
+InitializePCandStackPointer
+-----------------------------
+Sets PC and SP from command-line arguments, then initializes the constants:
+    ZeroRegister = "0000000000000000"   (all zeros)
+    PositiveOne  = "0000000000000001"   (+1)
+    NegativeOne  = "1111111111111111"   (-1 in two's complement)
+    Amask        = "0000111111111111"   (masks top 4 bits, used for address extraction)
+    Smask        = "0000000011111111"   (masks top 8 bits, used for sign extension)
+
+
+================================================================================
+alu.c — The ALU
+================================================================================
+
+Add(Left, Right, AluOutput)
+-----------------------------
+A full RIPPLE-CARRY ADDER implemented bit by bit, right to left (LSB first).
+All 8 cases of (carry, left-bit, right-bit) are handled explicitly with if/else
+chains. This literally simulates individual logic gates.
+
+And(Left, Right, AluOutput)
+-----------------------------
+Bitwise AND, scanning left to right character by character.
+
+NotA(Left, AluOutput)
+----------------------
+Bitwise NOT of the left operand only.
+
+ActivateAlu — Dispatch Table
+------------------------------
+    AluBits  Operation
+    -------  -------------------------
+    "00"     ADD
+    "01"     AND
+    "10"     Pass A (copy left to output)
+    "11"     NOT A
+
+After the operation, sets the condition flags:
+    N bit: AluOutput[0] == '1'  (MSB is set = negative in two's complement)
+    Z bit: '1' if ALL 16 bits are '0' (result is zero), '0' otherwise
+
+These flags are stored as globals in cpu.c and checked in subcycle 4 for
+conditional branches.
+
+
+================================================================================
+shifter.c — The Barrel Shifter
+================================================================================
+
+ShiftLeft(InputBits, ShifterOutput)
+-------------------------------------
+Copies InputBits[1..15] into ShifterOutput[0..14], sets ShifterOutput[15]='0'.
+Logical left shift by 1 (multiply by 2, MSB dropped).
+
+ShiftRight(InputBits, ShifterOutput)
+--------------------------------------
+Sets ShifterOutput[0]='0', copies InputBits[0..14] into ShifterOutput[1..15].
+Logical right shift by 1 (divide by 2 unsigned, LSB dropped).
+
+ActivateShifter — Dispatch Table
+----------------------------------
+    ShiftBits  Operation
+    ---------  --------------------
+    "00"       No shift (pass through)
+    "01"       Shift right 1
+    "10"       Shift left 1
+    "11"       No shift (pass through)
+
+
+================================================================================
+memory.c — The Memory System
+================================================================================
+
+LAYOUT
+------
+The full address space is 4096 x 16-bit words, split across 4 chips of 1024 words each.
+The top 2 bits of the 12-bit address select the chip; the bottom 10 bits are the offset.
+
+    Address bits [0-1]:  chip select (00=chip0, 01=chip1, 10=chip2, 11=chip3)
+    Address bits [2-11]: offset within chip (0-1023)
+
+    Total addressable memory: 4 chips x 1024 slots x 16 bits = 4096 words
+
+
+ComputeChipSelect and ComputeOffset
+-------------------------------------
+Simple binary-string-to-int conversions to pick the chip and the row within it.
+
+
+ActivateMemoryChip0/1/2 — Normal RAM
+--------------------------------------
+These are identical: if ReadBit=='1', copy 16 chars from the chip into Data.
+If WriteBit=='1', copy Data into the chip. Chips 0-2 are plain RAM.
+
+
+ActivateMemoryChip3 — Memory-Mapped I/O
+-----------------------------------------
+Chip 3 is special. Offsets 0-1019 work like normal RAM. But offsets 1020-1023
+are hardware registers:
+
+    Offset  Role
+    ------  -----------------------------------------------------------------
+    1020    Input data register  — holds the next character from stdin
+    1021    Input control/status — bit 12=input-enable, bit 14=data-ready,
+                                   bit 15=buffer-empty
+    1022    Output data register — write a character here to print to stdout
+    1023    Output control/status— bit 12=output-enable, bit 14=output-ready,
+                                   bit 15=output-done
+
+When offset 1022 is written (and output is enabled in 1023):
+    calls write(1, &char, 1) to actually output the character to stdout.
+
+When offset 1021 is written with bit 12 set:
+    sets polled_io = 1, meaning the emulator should start non-blocking stdin polling.
+
+When offset 1020 is read (and input is available):
+    advances through buffered input characters, updating status bits in 1021.
+
+
+InitializeMemory
+-----------------
+1. Fills all 4096 slots with "1111111111111111" (all-ones = undefined/trap pattern)
+2. Zeros out the 4 I/O control registers in chip 3 (offsets 1020-1023)
+3. Reads the program file line by line, loading each 16-char binary string
+   into memory starting at slot 0
+
+
+================================================================================
+cpu.c — The CPU Glue
+================================================================================
+
+    Bit NBit, ZBit;                  // ALU condition flags (global state)
+    Bit AmuxBit, MbrBit, MarBit;     // control signals
+    DataBusType ABits, BBits, CBits; // one-hot register selectors
+    TwoBits AluBits, ShiftBits;      // 2-bit control fields
+
+ActivateCpu is a thin wrapper that calls the two halves of the CPU in order:
+
+    1. ActivateControlStore  — reads the MIR, decodes fields, sets all control wires
+    2. ActivateDataPath      — uses those control wires to move data through ALU/shifter/registers
+
+
+================================================================================
+driver.c — The Main Loop and Debugger
+================================================================================
+
+btoi(char *mem_loc)
+--------------------
+Converts a 16-char binary string to an integer using the precomputed power2[]
+table (powers of 2 from 1 to 32768, stored as int).
+
+btoc(char *mem_loc)
+--------------------
+Same but only looks at the LOWER 8 BITS (positions 8-15) and returns a char.
+Used to extract ASCII characters from memory words for I/O output.
+
+True_ascii_to_mem_ascii(char *mem_location, char *character)
+-------------------------------------------------------------
+Inverse of btoc. Takes a real ASCII character and writes its bits into positions
+8-15 of a 16-char memory word (upper 8 bits stay '0').
+
+
+do_step — One Subcycle
+-----------------------
+    static int do_step(...) {
+        // 1. If waiting for input, try non-blocking read from stdin.
+        //    If data arrived, store it and update I/O status registers.
+
+        GeneratePulse();                                    // advance subcycle counter
+        ActivateCpu(Address, Data, ReadBit, WriteBit);      // run control + datapath
+        ActivateMemory(Address, Data, *ReadBit, *WriteBit); // run memory
+
+        // HALT condition: ReadBit AND WriteBit both set simultaneously
+        return (*ReadBit == One) && (*WriteBit == One);
+    }
+
+The halt is detected by the microprogram issuing a read AND write at the same
+time — that's an impossible/illegal combination in normal operation, so it's
+used as the stop signal.
+
+
+main — Startup and Debugger Protocol
+--------------------------------------
+The program doesn't run freely — it communicates with an external debugger over
+FILE DESCRIPTORS 3 and 4 (not stdin/stdout). FD 3 is commands in, FD 4 is
+responses out. It must be launched by a parent process that sets up those pipes.
+
+Command-line arguments:
+    mic1 <promfile> <programfile> <pc> <sp>
+
+Startup sequence:
+    BurnInProm(promfile)               — load microprogram into control store
+    InitializeMemory(programfile)      — load machine program into RAM
+    InitializePCandStackPointer(pc,sp) — set starting PC and SP
+
+Debugger Commands:
+    step              — run one subcycle, reply "OK" or "HALTED"
+    run               — run until halt or breakpoint, reply "HALTED" or "BREAK <addr>"
+    break <addr>      — set a breakpoint at PC address
+    delbreak <addr>   — remove a breakpoint
+    regs              — dump all registers: "REGS PC=N AC=N SP=N IR=N TI=N ..."
+    mem <addr>        — read one memory word: "MEM <addr> <bits> <decimal>"
+    quit              — clean shutdown
+
+Breakpoints work by comparing btoi(ProgramCounter) against the breakpoint list
+after each do_step call.
+
+
+================================================================================
+HOW ONE MACHINE INSTRUCTION EXECUTES (Example: ADD AC + X -> AC)
+================================================================================
+
+The microprogram encodes this as microinstructions. Example flow:
+
+MicroInstruction 1: A=AC(reg1), B=X, ALU=ADD("00"), ENC=1, C=AC(reg1), COND=00
+
+    Subcycle 1: Load MIR, set AluBits="00", AmuxBit='0'
+    Subcycle 2: ABits = "0100000000000000" (AC), BBits = "..." (X) -> latch both
+    Subcycle 3: ALU adds ALatch + BLatch -> AluResult, shifter passes through
+    Subcycle 4: Write ShifterResult back to AC register, MicroPC++
+
+MicroInstruction 2: fetch next macro-instruction (RD=1, MAR=PC, etc.)
+
+Each macro-instruction is 1-10+ microinstructions deep. The microprogram is
+what you load with BurnInProm. The machine program (the actual user code) is
+loaded with InitializeMemory.
+
+
+================================================================================
+SUMMARY: WHAT YOU NEED FOR A C++ REWRITE
+================================================================================
+
+    C concept                        C++ equivalent
+    -------------------------------- -----------------------------------------------
+    char[17] for bits                uint16_t (MUCH faster, use bitwise ops directly)
+    strcpy to copy registers         assignment: uint16_t reg = value
+    One-hot 16-bit selector strings  just an int index (0-15)
+    Global registers in datapath.c   a RegisterFile struct or class
+    MicroMemory[256] of char[33]     std::array<uint32_t, 256> (pack fields as bits)
+    4 subcycle if-chains             switch(subcycle) or a state machine
+    Memory chips as char[1024][17]   std::array<uint16_t, 1024> x 4
+    Halt via RD+WR both set          a bool halted flag or exception
+    Debugger on FD 3/4               a proper socket or pipe abstraction
+    btoi() / btoc()                  not needed — data is already integers
+    Add() ripple-carry loop          uint16_t a + b (the hardware does it for you)
+
+The biggest win in a C++ rewrite is replacing all ASCII-bit string manipulation
+with real uint16_t values and bitwise operators (&, |, ^, ~, >>, <<). The logic
+is identical but orders of magnitude faster. The entire ALU (alu.c) collapses to
+about 10 lines. The register file (datapath.c) collapses to an array of 16 uint16_t.
+
+The architecture is clean and well-separated already — each .c file maps directly
+to a C++ class or module:
+
+    clock.c     -> Clock class (subcycle counter)
+    control.c   -> ControlStore class (microprogram, MIR, MicroPC)
+    datapath.c  -> DataPath class (registers, ALU/shifter dispatch)
+    alu.c       -> Alu class or free functions
+    shifter.c   -> Shifter class or free functions
+    memory.c    -> Memory class (4 chips + MMIO)
+    cpu.c       -> Cpu class (owns ControlStore + DataPath)
+    driver.c    -> main() + Debugger class
