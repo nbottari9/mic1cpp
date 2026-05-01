@@ -5,6 +5,7 @@
 #include <bitset>
 #include <sstream>
 #include <exception>
+#include <algorithm>
 
 #define MICRO_WORD_SIZE sizeof(uint32_t)
 #define CONTROL_STORE_MAX_SIZE 256
@@ -37,7 +38,12 @@ public:
 
     friend std::ostream& operator<<(std::ostream& os, ControlStore& cs); // output entire micro memory
 
-    const MicroWord& getInstruction(size_t addr) const; // get one instruction from micro memory
+    const MicroWord& GetMicroInstructionAt(size_t addr) const; // get one instruction from micro memory
+
+    MicroWord* GetMIR() const;
+    void IncrementMIR();
+    void SetMIR();
+
 
 private:
     std::vector<MicroWord> _microMemory;

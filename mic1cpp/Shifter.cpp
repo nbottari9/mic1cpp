@@ -5,9 +5,10 @@ namespace Shifter {
         uint16_t result;
 
         switch (ctlBits) {
-            case 0b00: result = input;
-            case 0b01: result = input >> 1;
-            case 0b10: result = input << 1;
+            case 0b00:  result = input;      break;
+            case 0b01:  result = input >> 1; break;
+            case 0b10:  result = input << 1; break;
+            default:    result = input;      break;
         }
 
         return result;
